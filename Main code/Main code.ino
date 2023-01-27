@@ -3,15 +3,11 @@
 // vlx - chinesium vl53l0x boards
 // driver - drv8833 
 
-//#include "Adafruit_VL53L0X.h"
-#include <VL53L0X.h>
-#include <Wire.h>
-//#include <MPU9250.h>
-
-//Adafruit_VL53L0X vlx = Adafruit_VL53L0X();
-VL53L0X vlx;
+#include <MPU9250.h>
+#include <PID_v2.h>
 
 TaskHandle_t Task2;
+MPU9250 mpu;
 
 // pinout
 #define AIN_1 26
@@ -22,6 +18,7 @@ TaskHandle_t Task2;
 
 #define IRS_LEFT 23
 #define IRS_RIGHT 19
+#define IRS_FRONT 18
 
 
 #define BAUD_RATE 115200
@@ -37,17 +34,19 @@ TaskHandle_t Task2;
 
 
 #define MAX_GYRO_ERROR 5 // degrees 
+#define MAX_VIENKE_ROT 6
 #define MAX_DELTA_SPD 5
-#define ACCEL_GAP 120
+#define ACCEL_GAP 1
 
 #define MIN_MOTOR_SPD 210 
 #define MAX_MOTOR_SPD 50
 #define AVOID_SPD 100
 #define GYRO_CORECT_SPD 100
-#define PID_SPD 100
+#define PID_SPD 140
 #define BOOST_MAX_SPD 150
+#define VIENKE_DELTA_SPD 60
 
-#define KP_DEFAULT 0.05
+#define KP_DEFAULT 1
 #define KI_DEFAULT 0
 #define KD_DEFAULT 0
 #define KP_BOOST 0.0075
@@ -57,20 +56,30 @@ TaskHandle_t Task2;
 
 unsigned long milk_0; // timer for start delay
 unsigned long milk_1; // timer for acceleration
+unsigned long milk_2;
 
 double distF;
 double dist1;
 double dist2;
+double prevdistF=1;
+double prevdist1=1;
+double prevdist2=1;
+
+double Yaw;
+double Pitch;
+double Roll;
+double aPitch;
 
 double kP;
 double kI;
 double kD;
-double I = 0; 
-double lastP=0;
 double target = 0;
 
 double lastSPD=0;
 int acelCounter = 0;
+int senstime;
+
+bool vienke = false;
 
 
 void sensors(void * pvParameters);
@@ -78,8 +87,9 @@ int speed();
 void PID();
 void drive();
 void avoid();
+void vienkeCorrect(int strenght, int speedA);
 //bool gyroCorr(bool correct = false);
-
+PID_v2 PIDobj(kP, kI, kD, PID::Direct);
 
 
 void setup() {
@@ -94,6 +104,7 @@ void setup() {
              &Task2,     /* Task handle to keep track of created task */
              1);  
   
+  Wire.begin();
   Serial.begin(BAUD_RATE);
   Serial.println("Hi");
   // pinmodes
@@ -109,65 +120,88 @@ void setup() {
   
 
   //mpu init
-
+  if (!mpu.setup(0x68)) {  // change to your own address
+      while (1) {
+          Serial.println("MPU connection failed. Please check your connection with `connection_check` example.");
+          delay(5000);
+      }
+  }
+  
   // start delay
   while(millis()-milk_0 <= START_DELAY)
   {
     digitalWrite(MOT_EN, LOW);
   }
-  //digitalWrite(MOT_EN, HIGH);
+  digitalWrite(MOT_EN, HIGH);
   Serial.println("Hi");
 }
 
 void loop() {
-  ///*
+
+  /*
   Serial.print(dist1);
   Serial.print("  ");
-  //Serial.print(distF);
-  //Serial.print("  ");
-  Serial.println(dist2);//*/
-  //milk_1 =millis();
+  Serial.print(distF);
+  Serial.print("  ");
+  Serial.print(dist2);
+  Serial.print("  ");//*/
+  milk_1 =millis();
   if(distF <= AVOID_DIST)
   {
     avoid();
   }
   else
   {
-    int P = -1*(dist1-dist2);
     int spdNow = speed();
-    //int P = target - error;
-    I += P;
-    int D = P -lastP;
-    double PIDval = P*kP + I*kI + D*kD;
+    int error = (dist1-dist2);
+    double PIDval = PIDobj.Run(error);
     drive(spdNow+PIDval, spdNow-PIDval);
-    lastP = P;
   }
-  //Serial.println(millis() - milk_1);
+  //Serial.print(millis() - milk_1);
+  //Serial.print("  ");
+  //Serial.println(senstime);
 }
 
 void sensors(void * pvParameters)
 {
-Wire.begin();
-//vlx init
-vlx.setMeasurementTimingBudget(VLX_REFRESH_PERIOD);
-vlx.init();
-vlx.startContinuous();
 while(1)
 {
+  milk_2 = millis();
   dist1 = pulseIn(IRS_LEFT, HIGH);
   dist1 = (dist1 - 1000) * 2;
   if(dist1 > 1300 ) 
     dist1 = 1300;
+  if(dist1 < 0)
+    dist1 =prevdist1;
+  prevdist1 = dist1;
 
-  distF = vlx.readRangeContinuousMillimeters();
+  distF = pulseIn(IRS_FRONT, HIGH);
+  distF = (distF - 1000) * 2;
+  if(distF > 480 ) 
+    distF = 550;
+  if(distF < 0)
+    distF = prevdistF;
+  prevdistF = distF;
 
   dist2 = pulseIn(IRS_RIGHT, HIGH);
   dist2 = (dist2 - 1000) * 2;
   if(dist2 > 1300 ) 
     dist2 = 1300;
+  if(dist2 < 0)
+    dist2 =prevdist2;
+  prevdist2 = dist2;
+
+  if (mpu.update()) {
+    Yaw = mpu.getYaw();
+    Pitch = mpu.getPitch();
+    Roll = mpu.getRoll();
+    vienke = false;
+    double TMP =mpu.getGyroY();
+    if(TMP > MAX_VIENKE_ROT)
+      vienke = true;
+  }
   
-  delay(5);
-  
+  senstime = millis()-milk_2;
 }
 }
 
@@ -224,13 +258,19 @@ int speed()
     acelCounter = 0;  
   }
   lastSPD = returnSPD;
+
+  if(vienke)
+  {
+    vienkeCorrect(200, returnSPD);
+  }
   
   return returnSPD;
 }
 
 void drive(int spdA, int spdB)
 {
-  /*if(spdA == spdB)
+  ///*
+  if(spdA == spdB)
   {
     Serial.print("<---( ");
     Serial.print(spdA);
@@ -315,6 +355,14 @@ void avoid()
   drive(0, 0);
 }
 
+void vienkeCorrect(int strenght, int speedA)
+{
+  Serial.println("vienke");
+  int bsA = speedA - VIENKE_DELTA_SPD;
+  bsA = constrain(bsA, 0, MAX_MOTOR_SPD);
+  drive(bsA, bsA);
+  delayMicroseconds(strenght);
+}
 
 
 
